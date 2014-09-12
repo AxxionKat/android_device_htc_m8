@@ -23,7 +23,6 @@ package org.cyanogenmod.dotcase;
 import org.cyanogenmod.dotcase.DotcaseConstants.Notification;
 
 import android.app.Activity;
-import android.app.INotificationManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -37,7 +36,6 @@ import android.os.PowerManager;
 import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.os.SystemClock;
-import android.service.notification.StatusBarNotification;
 import android.util.Log;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
@@ -51,31 +49,19 @@ import java.lang.Math;
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
-import java.util.List;
-import java.util.Vector;
 
 public class Dotcase extends Activity implements SensorEventListener
 {
     private static final String TAG = "Dotcase";
 
     private static final String COVER_NODE = "/sys/android_touch/cover";
-    private final IntentFilter filter = new IntentFilter();
+    private final IntentFilter mFilter = new IntentFilter();
     private GestureDetector mDetector;
-    private PowerManager powerManager;
-    private SensorManager sensorManager;
+    private PowerManager mPowerManager;
+    private SensorManager mSensorManager;
     private static Context mContext;
-    private static boolean running = true;
-    private static boolean pocketed = false;
 
-    public static boolean reset_timer = false;
-
-    public static boolean ringing = false;
-    public static int ringCounter = 0;
-    public static String phoneNumber = "";
-    public static boolean torchStatus = false;
-    public static boolean alarm_clock = false;
-
-    public static List<Notification> notifications = new Vector<Notification>();
+    static DotcaseStatus sStatus = new DotcaseStatus();
 
     @Override
     public void onCreate(Bundle savedInstanceState)
@@ -84,9 +70,9 @@ public class Dotcase extends Activity implements SensorEventListener
 
         mContext = this;
 
-        filter.addAction(DotcaseConstants.ACTION_KILL_ACTIVITY);
-        filter.addAction(TorchConstants.ACTION_STATE_CHANGED);
-        mContext.getApplicationContext().registerReceiver(receiver, filter);
+        mFilter.addAction(DotcaseConstants.ACTION_KILL_ACTIVITY);
+        mFilter.addAction(TorchConstants.ACTION_STATE_CHANGED);
+        mContext.getApplicationContext().registerReceiver(receiver, mFilter);
 
         getWindow().addFlags(
                     WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON|
@@ -103,20 +89,20 @@ public class Dotcase extends Activity implements SensorEventListener
         final DrawView drawView = new DrawView(mContext);
         setContentView(drawView);
 
-        powerManager = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
-        sensorManager = (SensorManager) mContext.getSystemService(Context.SENSOR_SERVICE);
+        mPowerManager = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
+        mSensorManager = (SensorManager) mContext.getSystemService(Context.SENSOR_SERVICE);
         mDetector = new GestureDetector(mContext, new DotcaseGestureListener());
-        running = false;
+        sStatus.stopRunning();
         new Thread(new Service()).start();
     }
 
     @Override
     public void onSensorChanged(SensorEvent event) {
         if (event.sensor.getType() == Sensor.TYPE_PROXIMITY) {
-            if (event.values[0] < event.sensor.getMaximumRange() && !pocketed) {
-                pocketed = true;
-            } else if (pocketed) {
-                pocketed = false;
+            if (event.values[0] < event.sensor.getMaximumRange() && !sStatus.isPocketed()) {
+                sStatus.setPocketed(true);
+            } else if (sStatus.isPocketed()) {
+                sStatus.setPocketed(false);
             }
         }
     }
@@ -127,8 +113,8 @@ public class Dotcase extends Activity implements SensorEventListener
     @Override
     protected void onResume() {
         super.onResume();
-        sensorManager.registerListener(this,
-                sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY),
+        mSensorManager.registerListener(this,
+                mSensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY),
                 SensorManager.SENSOR_DELAY_NORMAL);
     }
 
@@ -136,7 +122,7 @@ public class Dotcase extends Activity implements SensorEventListener
     protected void onPause() {
         super.onPause();
         try {
-            sensorManager.unregisterListener(this);
+            mSensorManager.unregisterListener(this);
         } catch (IllegalArgumentException e) {
             Log.e(TAG, "Failed to unregister listener", e);
         }
@@ -145,9 +131,9 @@ public class Dotcase extends Activity implements SensorEventListener
     class Service implements Runnable {
         @Override
         public void run() {
-            if (!running) {
-                running = true;
-                while (running) {
+            if (!sStatus.isRunning()) {
+                sStatus.startRunning();
+                while (sStatus.isRunning()) {
                     Intent batteryIntent = mContext.getApplicationContext().registerReceiver(null,
                                              new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
                     int timeout;
@@ -159,12 +145,11 @@ public class Dotcase extends Activity implements SensorEventListener
                     }
 
                     for (int i = 0; i <= timeout; i++) {
-                        if (reset_timer || ringing || alarm_clock) {
+                        if (sStatus.isResetTimer() || sStatus.isRinging() || sStatus.isAlarm()) {
                             i = 0;
-                            reset_timer = false;
                         }
 
-                        if (!running) {
+                        if (!sStatus.isRunning()) {
                             return;
                         }
 
@@ -174,7 +159,7 @@ public class Dotcase extends Activity implements SensorEventListener
                             br.close();
 
                             if (value.equals("0")) {
-                                running = false;
+                                sStatus.stopRunning();
                                 finish();
                                 overridePendingTransition(0, 0);
                             }
@@ -194,56 +179,21 @@ public class Dotcase extends Activity implements SensorEventListener
                         intent.setAction(DotcaseConstants.ACTION_REDRAW);
                         mContext.sendBroadcast(intent);
                     }
-                    powerManager.goToSleep(SystemClock.uptimeMillis());
+                    mPowerManager.goToSleep(SystemClock.uptimeMillis());
                 }
             }
-        }
-    }
-
-    public static void checkNotifications() {
-        StatusBarNotification[] statusNotes = null;
-        notifications.clear();
-
-        try {
-            INotificationManager notificationManager = INotificationManager.Stub.asInterface(
-                    ServiceManager.getService(Context.NOTIFICATION_SERVICE));
-            statusNotes = notificationManager.getActiveNotifications(mContext.getPackageName());
-            for (StatusBarNotification statusNote : statusNotes) {
-                Notification notification = DotcaseConstants.notificationMap.get(
-                        statusNote.getPackageName());
-                if (notification != null && !notifications.contains(notification)) {
-                    notifications.add(notification);
-                }
-            }
-        } catch (NullPointerException e) {
-            Log.e(TAG, "Error retrieving notifications", e);
-            notifications.clear();
-        } catch (RemoteException e) {
-            Log.e(TAG, "Error retrieving notifications", e);
-            notifications.clear();
-        }
-
-        try {
-            if (notifications.size() > 6) {
-                notifications.subList(5, notifications.size()).clear();
-                notifications.add(Notification.DOTS);
-            }
-        } catch (IndexOutOfBoundsException e) {
-            // This should never happen...
-            Log.e(TAG, "Error sublisting notifications, clearing to be safe", e);
-            notifications.clear();
         }
     }
 
     @Override
     public void onDestroy() {
-        running = false;
+        sStatus.stopRunning();
         super.onDestroy();
     }
 
     @Override
     public boolean onTouchEvent(MotionEvent event){
-        if (!pocketed) {
+        if (!sStatus.isPocketed()) {
             this.mDetector.onTouchEvent(event);
             return super.onTouchEvent(event);
         } else {
@@ -263,15 +213,15 @@ public class Dotcase extends Activity implements SensorEventListener
 
         @Override
         public boolean onDoubleTap(MotionEvent event) {
-            powerManager.goToSleep(SystemClock.uptimeMillis());
+            mPowerManager.goToSleep(SystemClock.uptimeMillis());
             return true;
         }
 
         @Override
         public boolean onScroll(MotionEvent e1, MotionEvent e2, float distanceX, float distanceY) {
             if (Math.abs(distanceY) > 60) {
-                if (ringing) {
-                    CoverObserver.topActivityKeeper = false;
+                if (sStatus.isRinging()) {
+                    sStatus.setOnTop(false);
                     ITelephony telephonyService = ITelephony.Stub.asInterface(
                             ServiceManager.checkService(Context.TELEPHONY_SERVICE));
                     if (distanceY < 60) {
@@ -287,18 +237,18 @@ public class Dotcase extends Activity implements SensorEventListener
                             Log.e(TAG, "Error answering call", e);
                         }
                     }
-                } else if (alarm_clock) {
+                } else if (sStatus.isAlarm()) {
                     Intent i = new Intent();
                     if (distanceY < 60) {
                         i.setAction("com.android.deskclock.ALARM_DISMISS");
-                        CoverObserver.topActivityKeeper = false;
+                        sStatus.setOnTop(false);
                         mContext.sendBroadcast(i);
-                        alarm_clock = false;
+                        sStatus.stopAlarm();
                     } else if (distanceY > 60) {
                         i.setAction("com.android.deskclock.ALARM_SNOOZE");
-                        CoverObserver.topActivityKeeper = false;
+                        sStatus.setOnTop(false);
                         mContext.sendBroadcast(i);
-                        alarm_clock = false;
+                        sStatus.stopAlarm();
                     }
                 }
             }
@@ -307,16 +257,16 @@ public class Dotcase extends Activity implements SensorEventListener
 
         @Override
         public boolean onSingleTapUp (MotionEvent e) {
-            if (Dotcase.torchStatus) {
-                if (e.getX() >19 * DotcaseConstants.dotratio
-                        && e.getX() < 26 * DotcaseConstants.dotratio
-                        && e.getY() > 22 * DotcaseConstants.dotratio
-                        && e.getY() < 32 * DotcaseConstants.dotratio){
+            if (sStatus.isTorch()) {
+                if (e.getX() >19 * DotcaseConstants.DOT_RATIO
+                        && e.getX() < 26 * DotcaseConstants.DOT_RATIO
+                        && e.getY() > 22 * DotcaseConstants.DOT_RATIO
+                        && e.getY() < 32 * DotcaseConstants.DOT_RATIO){
                     Intent i = new Intent(TorchConstants.ACTION_TOGGLE_STATE);
                     mContext.sendBroadcast(i);
                 }
             }
-            reset_timer = true;
+            sStatus.resetTimer();
             return true;
         }
     }
@@ -330,11 +280,11 @@ public class Dotcase extends Activity implements SensorEventListener
                 } catch (IllegalArgumentException e) {
                     Log.e(TAG, "Failed to unregister receiver", e);
                 }
-                running = false;
+                sStatus.stopRunning();
                 finish();
                 overridePendingTransition(0, 0);
             } else if (intent.getAction().equals(TorchConstants.ACTION_STATE_CHANGED)) {
-                torchStatus = intent.getIntExtra(TorchConstants.EXTRA_CURRENT_STATE, 0) != 0;
+                sStatus.setTorch(intent.getIntExtra(TorchConstants.EXTRA_CURRENT_STATE, 0) != 0);
             }
         }
     };
